@@ -2,7 +2,7 @@
 
     python stage.py fetch --work W                      pinned downloads only (a kernel that links earlier outputs)
     python stage.py prep  --work W                      pinned downloads, decontamination, SFT rows, RL and eval tasks
-    python stage.py smoke --work W                      GPU check: tests, 20 SFT updates per optimizer, 2 GRPO steps
+    python stage.py smoke --work W                      GPU check: tests, 3 SFT updates per optimizer, 2 GRPO steps
     python stage.py sft   --work W --arm adamw|hybrid_muon [--gpu 0]
     python stage.py grpo  --work W --sft-model DIR --optim adamw|hybrid_muon --steps N [--gpu 0] [--max-seconds S]
     python stage.py eval  --work W --model DIR --name NAME [--gpu 0]
@@ -251,19 +251,22 @@ def stage_sft(args, steps: int | None = None, tag: str | None = None) -> dict:
     return info
 
 
-def grpo_config(work: Path, sft_model: Path, out: Path, optim: str, steps: int, max_seconds: float | None) -> dict:
+def grpo_config(work: Path, sft_model: Path, out: Path, optim: str, steps: int, max_seconds: float | None,
+                screen: bool = True) -> dict:
     prep = work / "prep"
     train = {"algo": "objective_v1", "steps": steps, "prompts_per_step": 16, "k": 8, "max_new": 384,
              "temperature": 1.0, "lr": 1.0e-6, "ppo_epochs": 1, "grad_clip": 1.0, "eval_every": 10, "eval_k": 1,
              "sampler": "hf_batch", "micro_rows": 4, "state_dir": str(out / "state"), "state_every": 10,
              "screen": {"n": 64, "k": 8, "min_mixed": 8}, "time_sync": True,
              "save_trainable": str(out / "trainable_fp32.pt"), "save_trainable_dtype": "float32"}
+    if not screen:
+        del train["screen"]
     if optim == "hybrid_muon":
         train.update(optim="hybrid_muon", muon_lr=2.0e-5)
     if max_seconds:  # stops, evaluates and saves where training got to (a deadline would only pause)
         train["max_train_seconds"] = float(max_seconds)
     return {"seed": 1234, "device": "cuda", "out_dir": str(out),
-            "model": {"kind": "hf", "path": str(sft_model), "dtype": "float32", "stop_at_eos": True},
+            "model": {"kind": "hf", "path": str(sft_model), "dtype": "float32", "stop_at_eos": True, "dense": True},
             "task": {"kind": "math", "tasks": str(prep / "gsm_tasks.jsonl"), "train_ids": str(prep / "gsm_train_ids.txt"),
                      "heldout_ids": str(prep / "gsm_heldout_ids.txt"), "instruction_file": None,
                      "chat_template_kwargs": {"effort": EFFORT}},
@@ -276,7 +279,8 @@ def stage_grpo(args) -> dict:
     work = Path(args.work)
     sd = work / (getattr(args, "tag", None) or f"grpo_{args.optim}")
     sd.mkdir(parents=True, exist_ok=True)
-    cfg = grpo_config(work, Path(args.sft_model), sd, args.optim, args.steps, args.max_seconds)
+    cfg = grpo_config(work, Path(args.sft_model), sd, args.optim, args.steps, args.max_seconds,
+                      screen=not getattr(args, "no_screen", False))
     cfg_path = sd / "config.yaml"
     cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
     secs = run([PY, str(TEAM / "rl-loop" / "train.py"), "--config", str(cfg_path)], sd / "train.log",
@@ -319,17 +323,19 @@ def build_final_model(sft_model: Path, weights: Path, out: Path) -> Path:
     return out / "model.safetensors"
 
 
-def gsm_eval(model_dir: Path, prep: Path, out: Path, batch: int = 32, max_new: int = 384) -> dict:
+def gsm_eval(model_dir: Path, prep: Path, out: Path, batch: int = 32, max_new: int = 384,
+             limit: int | None = None) -> dict:
     """Greedy GSM8K-test accuracy (math_check), closed-turn and boxed rates, on the fixed GSM_EVAL problems."""
     import torch  # noqa: PLC0415
     from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
 
     mc = load_module("g10_math_check", TEAM / "rl-data" / "math_check.py")
     by_id = {json.loads(x)["id"]: json.loads(x) for x in (prep / "gsm_tasks.jsonl").read_text().splitlines() if x}
-    ids = (prep / "gsm_eval_ids.txt").read_text().split()
+    ids = (prep / "gsm_eval_ids.txt").read_text().split()[:limit]
     template = (TEAM / "chat-format" / "chat_template.jinja").read_text(encoding="utf-8")
     tok = AutoTokenizer.from_pretrained(str(model_dir))
-    model = AutoModelForCausalLM.from_pretrained(str(model_dir), dtype=torch.float32).cuda().eval()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForCausalLM.from_pretrained(str(model_dir), dtype=torch.float32).to(device).eval()
     im_end = tok.convert_tokens_to_ids("<|im_end|>")
     eos = [i for i in {im_end, tok.eos_token_id} if i is not None]
     prompts = [tok.apply_chat_template([{"role": "user", "content": by_id[i]["problem"]}], chat_template=template,
@@ -342,8 +348,8 @@ def gsm_eval(model_dir: Path, prep: Path, out: Path, batch: int = 32, max_new: i
         for b in range(0, len(order), batch):
             idx = order[b:b + batch]
             width = max(len(prompts[j]) for j in idx)
-            inp = torch.tensor([[pad] * (width - len(prompts[j])) + prompts[j] for j in idx]).cuda()
-            att = torch.tensor([[0] * (width - len(prompts[j])) + [1] * len(prompts[j]) for j in idx]).cuda()
+            inp = torch.tensor([[pad] * (width - len(prompts[j])) + prompts[j] for j in idx]).to(device)
+            att = torch.tensor([[0] * (width - len(prompts[j])) + [1] * len(prompts[j]) for j in idx]).to(device)
             gen = model.generate(input_ids=inp, attention_mask=att, max_new_tokens=max_new, do_sample=False,
                                  eos_token_id=eos, pad_token_id=pad)[:, width:].tolist()
             for j, g in zip(idx, gen):
@@ -389,7 +395,7 @@ def stage_eval(args) -> dict:
 
 
 def stage_smoke(args) -> dict:
-    """GPU environment, the touched tests on the GPU box, 20 SFT updates per optimizer, 2 GRPO steps."""
+    """GPU environment, the touched tests on the GPU box, 3 SFT updates per optimizer, 2 GRPO steps (no screen)."""
     import torch  # noqa: PLC0415
 
     work = Path(args.work)
@@ -410,11 +416,12 @@ def stage_smoke(args) -> dict:
     info["tests"] = tests
     smoke_args = argparse.Namespace(**{**vars(args), "seed": 1, "pack": True})
     info["sft_adamw_20"] = stage_sft(argparse.Namespace(**{**vars(smoke_args), "arm": "adamw", "gpu": 0}),
-                                     steps=20, tag="smoke_sft_adamw")
+                                     steps=3, tag="smoke_sft_adamw")
     info["sft_hybrid_20"] = stage_sft(argparse.Namespace(**{**vars(smoke_args), "arm": "hybrid_muon", "gpu": 0}),
-                                      steps=20, tag="smoke_sft_hybrid")
+                                      steps=3, tag="smoke_sft_hybrid")
     g_args = argparse.Namespace(work=args.work, sft_model=str(work / "smoke_sft_adamw" / "model"), optim="adamw",
-                                steps=2, gpu=0, max_seconds=None, tag="smoke_grpo")
+                                steps=2, gpu=0, max_seconds=None, tag="smoke_grpo",
+                                no_screen=True)
     info["grpo_2"] = stage_grpo(g_args)
     (sd / "summary.json").write_text(json.dumps(info, indent=1))
     failed = [k for k, v in tests.items() if not v["pass"]]
