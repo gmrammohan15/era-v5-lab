@@ -24,9 +24,27 @@ STAGE = "teams/10-post-training/capstone/kaggle_e2e/stage.py"
 def plans(grpo_steps: int, grpo_seconds: int, sft_model: str) -> dict:
     sft = "/kaggle/working/w/sft_{}/model"
     return {
+        "full": {"title": "g10-e2e-full", "sources": [],
+                 "groups": [[["prep"]], [["smoke"]],
+                            [["sft", "--arm", "adamw", "--pack", "--gpu", "0"],
+                             ["sft", "--arm", "hybrid_muon", "--pack", "--gpu", "1"]],
+                            [["eval", "--model", sft.format("adamw"), "--name", "sft_adamw", "--gpu", "0"],
+                             ["eval", "--model", sft.format("hybrid_muon"), "--name", "sft_hybrid_muon", "--gpu", "1"]],
+                            [["eval", "--model", "/kaggle/working/w/src/model", "--name", "base", "--gpu", "0"]],
+                            [["grpo", "--sft-model", sft_model, "--optim", "adamw", "--steps", str(grpo_steps),
+                              "--max-seconds", str(grpo_seconds), "--gpu", "0"],
+                             ["grpo", "--sft-model", sft_model, "--optim", "hybrid_muon", "--steps", str(grpo_steps),
+                              "--max-seconds", str(grpo_seconds), "--gpu", "1"]],
+                            [["eval", "--model", "/kaggle/working/w/grpo_adamw/final_model", "--name", "grpo_adamw",
+                              "--gpu", "0"],
+                             ["eval", "--model", "/kaggle/working/w/grpo_hybrid_muon/final_model",
+                              "--name", "grpo_hybrid_muon", "--gpu", "1"]]],
+                 "keep": ["prep", "smoke", "smoke_sft_adamw", "smoke_sft_hybrid", "smoke_grpo", "sft_adamw",
+                          "sft_hybrid_muon", "eval_base", "eval_sft_adamw", "eval_sft_hybrid_muon", "grpo_adamw",
+                          "grpo_hybrid_muon", "eval_grpo_adamw", "eval_grpo_hybrid_muon"]},
         "k0": {"title": "g10-e2e-k0-smoke", "sources": [],
                "groups": [[["prep"]], [["smoke"]]], "keep": ["prep", "smoke", "smoke_sft_adamw", "smoke_sft_hybrid",
-                                                            "grpo_adamw"]},
+                                                            "smoke_grpo"]},
         "k1": {"title": "g10-e2e-k1-sft", "sources": [],
                "groups": [[["prep"]],
                           [["sft", "--arm", "adamw", "--pack", "--gpu", "0"],
@@ -108,11 +126,11 @@ def kernel_files(kernel: str, sha: str, plan: dict) -> tuple[str, dict]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--kernel", required=True, choices=("k0", "k1", "k3", "k4"))
+    ap.add_argument("--kernel", required=True, choices=("full", "k0", "k1", "k3", "k4"))
     ap.add_argument("--sha", required=True)
     ap.add_argument("--dir", type=Path, required=True, help="scratch folder for the generated kernel (not the repo)")
     ap.add_argument("--grpo-steps", type=int, default=100)
-    ap.add_argument("--grpo-seconds", type=int, default=5 * 3600)
+    ap.add_argument("--grpo-seconds", type=int, default=16200, help="train.max_train_seconds per GRPO run (4.5 h)")
     ap.add_argument("--sft-model", default="/kaggle/working/w/sft_adamw/model")
     ap.add_argument("--kaggle", default="kaggle")
     ap.add_argument("--dry-run", action="store_true")

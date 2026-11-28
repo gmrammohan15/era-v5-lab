@@ -53,7 +53,8 @@ def test_grpo_config_is_accepted_by_the_rl_loop(tmp_path, optim):
     cfg = stage.grpo_config(tmp_path, tmp_path / "m", tmp_path / "out", optim, 50, 3600)
     t = cfg["train"]
     assert cfg["task"]["chat_template_kwargs"] == {"effort": stage.EFFORT} and t["algo"] == "objective_v1"
-    assert "kl_coef" not in t and "tis_clip" not in t and t["deadline_unix"] > 0
+    assert "kl_coef" not in t and "tis_clip" not in t and t["max_train_seconds"] == 3600
+    assert "deadline_unix" not in t and t["save_trainable_dtype"] == "float32"
     _, info = train.build_optimizer(t, [("w", __import__("torch").nn.Parameter(__import__("torch").zeros(4, 4)))])
     assert info["kind"] == optim
 
@@ -91,7 +92,7 @@ import push  # noqa: E402
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
-@parametrize("kernel", ["k0", "k1", "k3", "k4"])
+@parametrize("kernel", ["full", "k0", "k1", "k3", "k4"])
 def test_kernel_script_compiles_private_and_clean(kernel):
     script, meta = push.kernel_files(kernel, SHA, push.plans(100, 3600, "/kaggle/working/w/sft_adamw/model")[kernel])
     compile(script, "kernel.py", "exec")

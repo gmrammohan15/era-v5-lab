@@ -258,8 +258,8 @@ def grpo_config(work: Path, sft_model: Path, out: Path, optim: str, steps: int, 
              "save_trainable": str(out / "trainable_fp32.pt"), "save_trainable_dtype": "float32"}
     if optim == "hybrid_muon":
         train.update(optim="hybrid_muon", muon_lr=2.0e-5)
-    if max_seconds:
-        train["deadline_unix"] = time.time() + max_seconds
+    if max_seconds:  # stops, evaluates and saves where training got to (a deadline would only pause)
+        train["max_train_seconds"] = float(max_seconds)
     return {"seed": 1234, "device": "cuda", "out_dir": str(out),
             "model": {"kind": "hf", "path": str(sft_model), "dtype": "float32", "stop_at_eos": True},
             "task": {"kind": "math", "tasks": str(prep / "gsm_tasks.jsonl"), "train_ids": str(prep / "gsm_train_ids.txt"),
@@ -272,7 +272,7 @@ def stage_grpo(args) -> dict:
     import yaml  # noqa: PLC0415
 
     work = Path(args.work)
-    sd = work / f"grpo_{args.optim}"
+    sd = work / (getattr(args, "tag", None) or f"grpo_{args.optim}")
     sd.mkdir(parents=True, exist_ok=True)
     cfg = grpo_config(work, Path(args.sft_model), sd, args.optim, args.steps, args.max_seconds)
     cfg_path = sd / "config.yaml"
@@ -412,9 +412,12 @@ def stage_smoke(args) -> dict:
     info["sft_hybrid_20"] = stage_sft(argparse.Namespace(**{**vars(smoke_args), "arm": "hybrid_muon", "gpu": 0}),
                                       steps=20, tag="smoke_sft_hybrid")
     g_args = argparse.Namespace(work=args.work, sft_model=str(work / "smoke_sft_adamw" / "model"), optim="adamw",
-                                steps=2, gpu=0, max_seconds=None)
+                                steps=2, gpu=0, max_seconds=None, tag="smoke_grpo")
     info["grpo_2"] = stage_grpo(g_args)
     (sd / "summary.json").write_text(json.dumps(info, indent=1))
+    failed = [k for k, v in tests.items() if not v["pass"]]
+    if failed:  # the full run must not start on a box where the touched tests fail
+        raise RuntimeError(f"smoke: tests failed on the GPU box: {failed}")
     return info
 
 
@@ -430,7 +433,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sft-model")
     ap.add_argument("--optim", choices=("adamw", "hybrid_muon"), default="adamw")
     ap.add_argument("--steps", type=int, default=100)
-    ap.add_argument("--max-seconds", type=float)
+    ap.add_argument("--max-seconds", type=float, help="grpo: train.max_train_seconds")
+    ap.add_argument("--tag", help="grpo: output folder name (default grpo_<optim>)")
     ap.add_argument("--model")
     ap.add_argument("--name")
     args = ap.parse_args(argv)
