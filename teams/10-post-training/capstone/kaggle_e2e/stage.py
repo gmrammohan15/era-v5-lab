@@ -41,7 +41,8 @@ GSM_HELDOUT = 256
 GSM_EVAL = 300
 # E9 arm A1 (results/e9_sft_before_rl.md): full fine-tune, FP32, lr 1e-4, 150 updates x 8,000 supervised tokens
 SFT_ARGS = ["--method", "full", "--steps", "150", "--batch-target-tokens", "8000", "--lr", "1e-4",
-            "--max-tokens", "2048", "--micro-tokens", "4096", "--warmup", "10", "--log-every", "10"]
+            "--max-tokens", "2048", "--micro-tokens", "4096", "--warmup", "10", "--log-every", "10",
+            "--grad-checkpointing"]  # a T4 (14.6 GB) runs out of memory without it at 4,096-token microbatches
 MUON_LR = "0.002"
 
 
@@ -216,7 +217,8 @@ def stage_prep(args) -> dict:
 
 
 def gpu_env(gpu: int | None) -> dict:
-    return {"CUDA_VISIBLE_DEVICES": str(gpu)} if gpu is not None else {}
+    env = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    return {**env, "CUDA_VISIBLE_DEVICES": str(gpu)} if gpu is not None else env
 
 
 def stage_sft(args, steps: int | None = None, tag: str | None = None) -> dict:
@@ -253,7 +255,7 @@ def grpo_config(work: Path, sft_model: Path, out: Path, optim: str, steps: int, 
     prep = work / "prep"
     train = {"algo": "objective_v1", "steps": steps, "prompts_per_step": 16, "k": 8, "max_new": 384,
              "temperature": 1.0, "lr": 1.0e-6, "ppo_epochs": 1, "grad_clip": 1.0, "eval_every": 10, "eval_k": 1,
-             "sampler": "hf_batch", "micro_rows": 16, "state_dir": str(out / "state"), "state_every": 10,
+             "sampler": "hf_batch", "micro_rows": 4, "state_dir": str(out / "state"), "state_every": 10,
              "screen": {"n": 64, "k": 8, "min_mixed": 8}, "time_sync": True,
              "save_trainable": str(out / "trainable_fp32.pt"), "save_trainable_dtype": "float32"}
     if optim == "hybrid_muon":

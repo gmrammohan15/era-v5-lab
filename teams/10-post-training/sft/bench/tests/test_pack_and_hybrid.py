@@ -195,6 +195,26 @@ def test_pack_run_matches_unpacked_first_loss(tiny):
     assert all(c["pass"] for c in p["checks"].values())
 
 
+@parametrize("optim", [[], ["--optim", "hybrid_muon", "--muon-lr", "2e-3"]], ids=["adamw", "hybrid_muon"])
+def test_pack_with_grad_checkpointing_matches_pack(tiny, optim):
+    """The Kaggle T4 run needs --grad-checkpointing: same losses with the block-diagonal mask and position ids."""
+    a = run(tiny, "pk_gc", ["--pack", "--grad-checkpointing", *optim], steps=3)
+    b = run(tiny, "pk_nogc", ["--pack", *optim], steps=3)
+    for x, y in zip(a["log"], b["log"]):
+        assert abs(x["loss"] - y["loss"]) < 1e-5
+    assert all(c["pass"] for c in a["checks"].values())
+
+
+@parametrize("optim", [[], ["--optim", "hybrid_muon", "--muon-lr", "2e-3"]], ids=["adamw", "hybrid_muon"])
+def test_pack_with_grad_checkpointing_matches_pack(tiny, optim):
+    """The Kaggle T4 run needs --grad-checkpointing: same losses with the block-diagonal mask and position ids."""
+    a = run(tiny, "pk_gc", ["--pack", "--grad-checkpointing", *optim], steps=3)
+    b = run(tiny, "pk_nogc", ["--pack", *optim], steps=3)
+    for x, y in zip(a["log"], b["log"]):
+        assert abs(x["loss"] - y["loss"]) < 1e-5
+    assert all(c["pass"] for c in a["checks"].values())
+
+
 @parametrize("extra,msg", [
     (["--optim", "hybrid_muon"], "needs --muon-lr"),
     (["--optim", "hybrid_muon", "--muon-lr", "0"], "needs --muon-lr"),
