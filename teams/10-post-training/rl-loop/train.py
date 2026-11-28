@@ -50,6 +50,11 @@ GPU-run options (config `train.*`, all optional):
                    before the screen and the first update, sample k completions of the first train prompt(s) with an own
                    generator, score them as the update will and compare with the behaviour log-probs at identical
                    weights; stop with an error above the tolerance; logprob_gate.json and summary["logprob_gate"]. Not with dt
+    optim          adamw (default) | hybrid_muon: 2-D matrices on Muon (weight decay 0) at muon_lr, the rest on AdamW at
+                   lr (capstone/hybrid_optim.py, TSAI 28 Nov rule); summary["optimizer"] gives the optimizer step's
+                   share of the train phase and of the step. Muon buffers are saved and restored with the state
+    save_trainable_dtype  bfloat16 (default) | float32: dtype of the save_trainable file. float32 keeps updates
+                   smaller than bf16 rounding (lr 1e-6 GRPO on fp32 weights)
     time_sync      default false: on CUDA, synchronize before each phase clock read so times_s splits a step exactly
                    (sampling = rollout, scoring = reward, update = old_logprobs + train); rows then carry times_synced.
                    Off, the clocks read host time only and queued GPU work can land in a later phase
@@ -63,6 +68,7 @@ import argparse
 import collections
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import random
@@ -151,9 +157,11 @@ def build_task(tcfg: dict, tokenizer, seed: int, pool=None):
 def math_task(tcfg: dict, tokenizer):
     """MATH-style tasks (rl-data/build_math.py records) scored by rl-data/math_check.py.
 
-    task: {kind: math, tasks: <jsonl>, train_ids: <file>, heldout_ids: <file>, instruction_file: <file or null>}
+    task: {kind: math, tasks: <jsonl>, train_ids: <file>, heldout_ids: <file>, instruction_file: <file or null>,
+           chat_template_kwargs: <mapping, optional>}
     The instruction file is written by a team member (TSAI 3 Nov rule) and holds the user message with {problem};
-    without it the raw problem text is the prompt.
+    without it the raw problem text is the prompt. chat_template_kwargs go to apply_chat_template, e.g. {effort: 1k}
+    so G10 ChatML v0 prompts carry the effort line the SFT rows were rendered with.
     """
     import importlib.util  # noqa: PLC0415
     if tokenizer is None:
@@ -181,7 +189,11 @@ def math_task(tcfg: dict, tokenizer):
         r = mc.score(by_id[env_id], text)
         return float(r["reward"]), r
 
-    return tasks.RewardEnvTask(tokenizer, items(tcfg["train_ids"]), items(tcfg["heldout_ids"]), reward_fn)
+    kwargs = tcfg.get("chat_template_kwargs") or {}
+    if not isinstance(kwargs, dict):
+        raise TypeError("task.chat_template_kwargs must be a mapping")
+    return tasks.RewardEnvTask(tokenizer, items(tcfg["train_ids"]), items(tcfg["heldout_ids"]), reward_fn,
+                               template_kwargs=kwargs)
 
 
 def stdio_task(tcfg: dict, tokenizer, pool=None):
@@ -318,6 +330,8 @@ def state_identity(cfg: dict, trainable_named, *, init_state_sha256: str | None 
         keys += ("dt",)
     if t.get("update_mode", "train") != "train":  # default runs keep the identities they had
         keys += ("update_mode",)
+    if t.get("optim", "adamw") != "adamw":  # absent = AdamW (states saved before train.optim existed)
+        keys += ("optim", "muon_lr")
     model = {k_: cfg["model"].get(k_) for k_ in ("kind", "path", "dtype", "config")}
     if init_state_sha256 is not None:
         model["init_state_sha256"] = init_state_sha256
@@ -465,6 +479,44 @@ def length_stats(rolls, max_new: int, eos_id) -> dict:
         toks += int(lens.sum())
         n += lens.numel()
     return {"truncated": round(cut / max(n, 1), 4), "mean_tokens": round(toks / max(n, 1), 1)}
+
+
+OPTIMS = ("adamw", "hybrid_muon")
+
+
+def build_optimizer(t: dict, trainable_named, dt: bool = False):
+    """train.optim: adamw (default) or hybrid_muon (capstone/hybrid_optim.py: 2-D matrices on Muon with weight decay 0
+    at train.muon_lr, the rest on AdamW at train.lr). Returns (optimizer, record for the summary)."""
+    kind = t.get("optim", "adamw")
+    if kind not in OPTIMS:
+        raise ValueError(f"train.optim must be one of {OPTIMS}, got {kind!r}")
+    lr, wd = float(t["lr"]), float(t.get("weight_decay", 0.0))
+    if kind == "adamw":
+        if t.get("muon_lr") is not None:
+            raise ValueError("train.muon_lr is only used with train.optim: hybrid_muon")
+        opt = torch.optim.AdamW([p for _, p in trainable_named], lr=lr, weight_decay=wd)
+        return opt, {"kind": "adamw", "adamw_lr": lr, "adamw_params": len(trainable_named)}
+    if dt:
+        raise ValueError("train.optim: hybrid_muon is not wired for Deletion Tuning (its gates would go to Muon)")
+    if not t.get("muon_lr") or float(t["muon_lr"]) <= 0:
+        raise ValueError("train.optim: hybrid_muon needs train.muon_lr > 0")
+    spec = importlib.util.spec_from_file_location("g10_hybrid_optim", HERE.parent / "capstone" / "hybrid_optim.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    opt = mod.build_optimizer(trainable_named, kind="hybrid_muon", lr=lr, muon_lr=float(t["muon_lr"]), wd=wd)
+    return opt, dict(opt.meta)
+
+
+def timed_step(opt, device: str) -> float:
+    """opt.step() and its wall time; on CUDA the queued work before and inside the step is waited for."""
+    cuda = str(device).startswith("cuda")
+    if cuda:
+        torch.cuda.synchronize(device)
+    c0 = time.perf_counter()
+    opt.step()
+    if cuda:
+        torch.cuda.synchronize(device)
+    return time.perf_counter() - c0
 
 
 def phase_clock(sync_device: str | None):
@@ -831,6 +883,8 @@ def train(cfg: dict) -> dict:
     out = Path(cfg.get("out_dir", "out"))
     out.mkdir(parents=True, exist_ok=True)
     t = cfg["train"]
+    if t.get("save_trainable_dtype", "bfloat16") not in ("bfloat16", "float32"):
+        raise ValueError("train.save_trainable_dtype must be bfloat16 or float32")
     algo, k, max_new = t["algo"], int(t["k"]), int(t["max_new"])
     temperature = float(t["temperature"])
     if algo not in grpo.ALL_ALGOS:
@@ -997,8 +1051,8 @@ def train(cfg: dict) -> dict:
         ref.model.requires_grad_(False)
         ref.model.eval()
     start_w = StartWeights(model)  # CPU copy of the trainable weights: weight-change check, and KL to start
-    opt = torch.optim.AdamW([p for _, p in trainable_named], lr=float(t["lr"]),
-                            weight_decay=float(t.get("weight_decay", 0.0)))
+    opt, optim_info = build_optimizer(t, trainable_named, dt=bool(dt_cfg))
+    optim_s = 0.0
     if kz is not None:
         kz.check_optimizer(opt)
     tis_clip = float(t["tis_clip"]) if t.get("tis_clip") else None
@@ -1058,7 +1112,8 @@ def train(cfg: dict) -> dict:
     dt_prev = dtmask.keep_masks(model) if dt_cfg else None  # hard mask before the next update (gross flip counts)
     if resumed is not None:
         read_jsonl(metrics_path, start_step)  # drop rows of steps that will be redone
-    past_evals = read_jsonl(evals_path, start_step) if resumed is not None else []
+    past_evals = (read_jsonl(evals_path, start_step if resumed.get("evaluated") else start_step - 1)
+                  if resumed is not None else [])
     if resumed is None and evals_path.exists():
         evals_path.unlink()
     metrics_f = open(metrics_path, "a" if resumed is not None else "w")
@@ -1072,8 +1127,11 @@ def train(cfg: dict) -> dict:
         elif r_["name"] == "train_cohort":
             cohort_scores[r_["step"]] = r_["scores"]
 
-    def write_state(step):
+    def write_state(step, evaluated=False):
+        # evaluated: the step's evaluations (which draw on gen) are done and logged; a state saved before them makes
+        # the resumed run drop and redo them, so the generators stay where an uninterrupted run has them
         payload = {"identity": identity, "step": step, "order": list(order), "cohort_ids": cohort_ids,
+                   "evaluated": evaluated,
                    "elapsed_s": prior_s + time.time() - start,
                    "trainable": {n_: p_.detach().to("cpu", copy=True) for n_, p_ in trainable_named},
                    "dt_steps": dtmask.masked_layers(model)[0][1].current_step if dt_cfg else None,
@@ -1226,11 +1284,16 @@ def train(cfg: dict) -> dict:
         cohort_eval(0)
     if extra_max_new:
         extra_eval(0)
+    if state_dir is not None and start_step == 0 and not (resumed or {}).get("evaluated"):
+        write_state(0, evaluated=True)
     if state_dir is not None and start_step > 0 and start_step % int(t.get("eval_every", 10)) == 0:
+        redo = start_step not in heldout_scores or (cohort_k and start_step not in cohort_scores)
         if start_step not in heldout_scores:  # killed during this step's evaluation: measure it now
             log_heldout(start_step)
         if cohort_k and start_step not in cohort_scores:
             cohort_eval(start_step)
+        if redo and start_step < int(t["steps"]):
+            write_state(start_step, evaluated=True)
     steps_done, paused, last_step_s = start_step, False, 0.0
     for step in range(start_step + 1, int(t["steps"]) + 1):
         if max_train_s is not None and step > 1 and time.time() - start > max_train_s:
@@ -1351,7 +1414,7 @@ def train(cfg: dict) -> dict:
                 grad_norm = float(torch.nn.utils.clip_grad_norm_([p for _, p in trainable_named],
                                                                  float(t.get("grad_clip", 1.0))))
                 probe_w.before()
-                opt.step()
+                optim_s += timed_step(opt, device)
                 if dt_cfg:
                     dtmask.step_all(model)
                 share, expected = probe_w.shares()
@@ -1404,7 +1467,7 @@ def train(cfg: dict) -> dict:
                     loss_val += lv
                 grad_norm = float(torch.nn.utils.clip_grad_norm_([p for _, p in trainable_named],
                                                                  float(t.get("grad_clip", 1.0))))
-                opt.step()
+                optim_s += timed_step(opt, device)
             if log_routing:
                 idx_after = routing.routing(policy, g[0], fmask)
                 step_flip = routing.flip_rate(idx_before, idx_after)[0]
@@ -1472,6 +1535,8 @@ def train(cfg: dict) -> dict:
                 rec["heldout_reward"], _ = log_heldout(step)
                 if cohort_k:
                     cohort_eval(step)
+                if step < int(t["steps"]):
+                    write_state(step, evaluated=True)
         if cfg.get("verbose", True):
             print(json.dumps(rec), flush=True)
     metrics_f.close()
@@ -1500,7 +1565,8 @@ def train(cfg: dict) -> dict:
     if t.get("save_trainable"):
         path = Path(t["save_trainable"])
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({n: p_.detach().to(torch.bfloat16).cpu() for n, p_ in trainable_named}, path)
+        save_dtype = getattr(torch, t.get("save_trainable_dtype", "bfloat16"))
+        torch.save({n: p_.detach().to(save_dtype).cpu() for n, p_ in trainable_named}, path)
         saved_weights = {"path": str(path), "bytes": path.stat().st_size,
                          "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
@@ -1537,6 +1603,11 @@ def train(cfg: dict) -> dict:
                "peak_gpu_memory_gb": (round(torch.cuda.max_memory_allocated() / 2**30, 2)
                                       if device.startswith("cuda") else None),
                **{f"end_{k_}": v for k_, v in gpu_memory().items()}, "versions": versions()}
+    train_s = sum(r["times_s"].get("train", 0.0) for r in recs[start_step:])
+    summary["optimizer"] = {**optim_info, "optim_seconds_this_call": round(optim_s, 3),
+                            "optim_share_of_train_phase": round(optim_s / train_s, 4) if train_s > 0 else None,
+                            "optim_share_of_step": round(optim_s / max(sum(r["step_s"] for r in recs[start_step:]),
+                                                                       1e-9), 4)}
     if any("mismatch_k3" in r for r in recs):
         ks = [r["mismatch_k3"] for r in recs if "mismatch_k3" in r]
         summary["mean_mismatch_k3"] = round(sum(ks) / len(ks), 6)

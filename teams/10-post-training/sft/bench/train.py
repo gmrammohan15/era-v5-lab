@@ -22,10 +22,21 @@ eval-mini can load the folder) and reloaded in a fresh object: every tensor must
 on a fixed batch must match exactly (full) or within the stated tolerance (lora: merged weights).
 
 This file never imports `evaluate.py` and refuses rows whose `split` is not "train" (eval firewall).
+
+Optimizer (`--optim`): `adamw` (default, unchanged) or `hybrid_muon` (TSAI 28 Nov rule, `capstone/hybrid_optim.py`:
+every 2D matrix on Muon with no weight decay, every other tensor on AdamW). Both report the optimizer's share of the
+training time, and the resumable state saves the Muon momentum buffers. The step-1 writeback check replays AdamW, so
+under `hybrid_muon` it watches a 1D tensor (a norm gain, which stays on AdamW).
+
+Packing (`--pack`): an update's rows are packed first-fit-decreasing into sequences of at most `--micro-tokens`, one
+sequence per microbatch (so no padding; `--micro-tokens` must be >= `--max-tokens`). Each row
+keeps its own positions (restarting at 0) and sees only itself through a block-diagonal causal mask; the position that
+would predict the next row's first token is not a target. Same loss as unpacked up to float rounding (tested).
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -59,7 +70,9 @@ def _load(name: str, path: Path):
 
 probe = _load("g10_train_probe_for_bench", HERE.parent / "train_probe.py")
 dtmask = _load("g10_dt_mask", HERE.parents[1] / "dt" / "mask.py")
+hybrid_optim = _load("g10_hybrid_optim", HERE.parents[1] / "capstone" / "hybrid_optim.py")
 IGNORE = probe.IGNORE
+OPTIMS = ("adamw", "hybrid_muon")
 ZeroTargetError = probe.ZeroTargetError
 masked_nll_sum = probe.masked_nll_sum
 METHODS = ("full", "lora", "dt", "markers")
@@ -128,6 +141,70 @@ def plan_microbatches(rows: list[dict], micro_tokens: int) -> list[list[dict]]:
     return groups
 
 
+@dataclasses.dataclass
+class PackedBatch(probe.Batch):
+    """probe.Batch whose attention_mask is a (B, 1, T, T) bool block-diagonal causal mask, plus per-row positions."""
+
+    position_ids: torch.Tensor | None = None
+
+
+def pack_bins(rows: list[dict], capacity: int) -> list[list[dict]]:
+    """First-fit decreasing: rows (each <= capacity tokens) into as few sequences of <= capacity tokens as it finds."""
+    bins: list[list[dict]] = []
+    room: list[int] = []
+    for r in sorted(rows, key=lambda r: len(r["input_ids"]), reverse=True):
+        n = len(r["input_ids"])
+        if n > capacity:
+            raise ValueError(f"row {r.get('id')} has {n} tokens, more than the pack capacity {capacity}")
+        for j, free in enumerate(room):
+            if n <= free:
+                bins[j].append(r)
+                room[j] -= n
+                break
+        else:
+            bins.append([r])
+            room.append(capacity - n)
+    return bins
+
+
+def collate_packed(bins: list[list[dict]], pad_id: int) -> PackedBatch:
+    """One sequence per bin. Padding gets its own segment, so no real token attends to it and no row is all-masked."""
+    T = max(sum(len(r["input_ids"]) for r in b) for b in bins)
+    B = len(bins)
+    ids = torch.full((B, T), pad_id, dtype=torch.long)
+    seg = torch.full((B, T), -1, dtype=torch.long)
+    pos = torch.zeros((B, T), dtype=torch.long)
+    labels = torch.full((B, T - 1), IGNORE, dtype=torch.long)
+    kinds = torch.full((B, T - 1), probe.KIND_PAD, dtype=torch.long)
+    for b, rows in enumerate(bins):
+        at = 0
+        for s, r in enumerate(rows):
+            n = len(r["input_ids"])
+            ids[b, at:at + n] = torch.tensor(r["input_ids"], dtype=torch.long)
+            seg[b, at:at + n] = s
+            pos[b, at:at + n] = torch.arange(n)
+            lab = torch.tensor(probe.shift_labels(r["input_ids"], r["loss_mask"]), dtype=torch.long)
+            labels[b, at:at + n - 1] = lab
+            kinds[b, at:at + n - 1] = torch.where(lab != IGNORE, probe.KIND_TARGET, probe.KIND_CONTEXT)
+            if s + 1 < len(rows):  # a row's last token would predict the next row's first token: context, never a target
+                kinds[b, at + n - 1] = probe.KIND_CONTEXT
+            at += n
+    causal = torch.tril(torch.ones(T, T, dtype=torch.bool))
+    attn = (seg[:, :, None] == seg[:, None, :]) & causal
+    return PackedBatch(ids, attn[:, None], labels, kinds, pos)
+
+
+def pack_microbatches(rows: list[dict], micro_tokens: int, pad_id: int) -> list[PackedBatch]:
+    """One packed sequence of <= micro_tokens tokens per microbatch: no padding slots at all. (Grouping sequences of
+    different lengths into one microbatch would pad a short leftover sequence to the longest one.)"""
+    return [collate_packed([b], pad_id) for b in pack_bins(rows, micro_tokens)]
+
+
+def slot_tokens(mb: probe.Batch) -> int:
+    """Token slots the forward pass computes (rows x padded length), real or padding."""
+    return int(mb.input_ids.numel())
+
+
 # ---------------------------------------------------------------- loss (train_probe contract)
 
 
@@ -136,9 +213,13 @@ def target_nll_sum(model: nn.Module, batch: probe.Batch) -> tuple[torch.Tensor, 
 
     Equal to masked_nll_sum(full shifted logits, labels): rows of the logits that carry IGNORE contribute nothing.
     """
-    # one unpadded row: no mask tensor, so attention takes the plain causal path (less memory on MPS)
-    attn = None if batch.input_ids.size(0) == 1 else batch.attention_mask
-    out = model.model(input_ids=batch.input_ids, attention_mask=attn)
+    pos = getattr(batch, "position_ids", None)
+    if pos is not None:  # packed: the block mask is needed even for one sequence (positions alone do not isolate rows)
+        out = model.model(input_ids=batch.input_ids, attention_mask=batch.attention_mask, position_ids=pos)
+    else:
+        # one unpadded row: no mask tensor, so attention takes the plain causal path (less memory on MPS)
+        attn = None if batch.input_ids.size(0) == 1 else batch.attention_mask
+        out = model.model(input_ids=batch.input_ids, attention_mask=attn)
     hidden = out.last_hidden_state[:, :-1, :]
     sel = batch.labels != IGNORE
     logits = model.lm_head(hidden[sel])  # (N, V)
@@ -168,7 +249,8 @@ def accumulate(model: nn.Module, mbs: list[probe.Batch], device) -> tuple[float,
         raise ZeroTargetError("update has no valid targets")
     total = torch.zeros((), device=device)
     for mb in mbs:
-        mb = probe.Batch(*(t.to(device) for t in (mb.input_ids, mb.attention_mask, mb.labels, mb.kinds)))
+        mb = dataclasses.replace(mb, **{f.name: getattr(mb, f.name).to(device) for f in dataclasses.fields(mb)
+                                        if getattr(mb, f.name) is not None})
         with autocast_ctx(device):
             nll, _ = target_nll_sum(model, mb)
         part = nll / global_count
@@ -457,8 +539,9 @@ def sync(device: str) -> None:
 
 def resume_key(args) -> str:
     """What a resumed run must share with the run that saved the state (everything but paths and logging)."""
+    off = {"frozen_bf16": False, "optim": "adamw", "muon_lr": None, "pack": False}  # flags added later: off = old key
     return json.dumps({k: v for k, v in sorted(vars(args).items())
-                       if k not in ("out", "log_every", "save_every") and not (k == "frozen_bf16" and not v)})
+                       if k not in ("out", "log_every", "save_every") and not (k in off and v == off[k])})
 
 
 def take_by_targets(order: list[int], n_tgt: list[int], budget: int, rng: random.Random) -> list[int]:
@@ -503,6 +586,16 @@ def train(args) -> dict:
                          "would shrink the marker rows)")
     if args.frozen_bf16 and (args.autocast != "bf16" or args.method == "full"):
         raise SystemExit("--frozen-bf16 needs --autocast bf16 and a method with frozen weights (dt, lora, markers)")
+    if args.optim == "hybrid_muon":
+        if args.method != "full" or args.train_marker_rows:
+            raise SystemExit("--optim hybrid_muon is implemented for --method full only (dt, lora and marker rows "
+                             "have their own learning-rate groups)")
+        if not args.muon_lr or args.muon_lr <= 0:
+            raise SystemExit("--optim hybrid_muon needs --muon-lr > 0 (the Muon group's peak learning rate)")
+    elif args.muon_lr is not None:
+        raise SystemExit("--muon-lr is only used with --optim hybrid_muon")
+    if args.pack and args.micro_tokens < args.max_tokens:
+        raise SystemExit("--pack needs --micro-tokens >= --max-tokens (a microbatch is one packed sequence)")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = args.device
@@ -553,12 +646,20 @@ def train(args) -> dict:
         groups = []
     if marker_params:
         groups.append({"params": marker_params, "base_lr": args.marker_lr})
-    # default (None) lets torch pick: foreach on CUDA, which holds one FP32 temporary the size of all trainable weights
-    # during the step (4 B per weight); --adam-fused uses the fused kernel, same update rule, no such temporary
-    opt = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=args.wd,
-                            fused=True if args.adam_fused else None)
-    # the tensor watched by the step-1 writeback check
-    if args.method == "full":
+    if args.optim == "hybrid_muon":
+        opt = hybrid_optim.build_optimizer(model.named_parameters(), kind="hybrid_muon", lr=args.lr,
+                                           muon_lr=args.muon_lr, wd=args.wd, betas=(0.9, 0.95), eps=1e-8)
+        optim_info = dict(opt.meta)
+    else:
+        # default (None) lets torch pick: foreach on CUDA, which holds one FP32 temporary the size of all trainable
+        # weights during the step (4 B per weight); --adam-fused uses the fused kernel, same update rule, no temporary
+        opt = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=args.wd,
+                                fused=True if args.adam_fused else None)
+        optim_info = {"kind": "adamw", "adamw_lr": args.lr}
+    # the tensor watched by the step-1 writeback check (an AdamW replay: under hybrid_muon, a 1D tensor on AdamW)
+    if args.optim == "hybrid_muon":
+        watch_name, watch = "model.layers.0.input_layernorm.weight", model.model.layers[0].input_layernorm.weight
+    elif args.method == "full":
         watch_name, watch = "model.layers.0.self_attn.q_proj.weight", model.model.layers[0].self_attn.q_proj.weight
     elif args.method == "dt":
         watch_name, layer0 = dtmask.masked_layers(model)[0]
@@ -578,7 +679,7 @@ def train(args) -> dict:
     seen_rows = 0
     # --save-every: resumable state (a crash or a killed session continues from the last save, bit-identical on CPU)
     ckpt = Path(args.out) / "train_state.pt"
-    start_step, prior_s = 0, 0.0
+    start_step, prior_s, optim_s = 0, 0.0, 0.0
     if args.save_every and args.method == "dt":
         raise SystemExit("--save-every is not implemented for dt (mask schedules keep their own step counters)")
     if args.save_every and ckpt.exists():
@@ -593,6 +694,7 @@ def train(args) -> dict:
         order[:], log[:], per100[:] = st["order"], st["log"], st["per100"]
         checks.update(st["checks"])
         seen_rows, start_step, prior_s = st["seen_rows"], st["step"], st["elapsed_s"]
+        optim_s = st.get("optim_s", 0.0)
         print(json.dumps({"resumed_from_step": start_step}), flush=True)
     n_tgt = [sum(r["loss_mask"][1:]) for r in rows] if args.batch_target_tokens else None
     for step in range(start_step, args.steps):
@@ -606,8 +708,10 @@ def train(args) -> dict:
                 rng.shuffle(perm)
                 order += perm
             take, order = order[: args.batch], order[args.batch :]
-        groups = plan_microbatches([rows[i] for i in take], args.micro_tokens)
-        mbs = [collate(g, pad_id) for g in groups]
+        if args.pack:
+            mbs = pack_microbatches([rows[i] for i in take], args.micro_tokens, pad_id)
+        else:
+            mbs = [collate(g, pad_id) for g in plan_microbatches([rows[i] for i in take], args.micro_tokens)]
         lr = lr_at(step, args)
         for g in opt.param_groups:
             g["lr"] = g["base_lr"] * lr / args.lr
@@ -622,7 +726,11 @@ def train(args) -> dict:
         gn = torch.nn.utils.clip_grad_norm_(params, args.clip)
         if step == 0:
             p0, g0 = watch.detach().clone(), watch.grad.detach().clone()
+        sync(device)
+        t_opt = time.perf_counter()
         opt.step()
+        sync(device)
+        optim_s += time.perf_counter() - t_opt
         if args.method == "dt":
             dtmask.step_all(model)
         if step == 0:
@@ -633,7 +741,8 @@ def train(args) -> dict:
             del p0, g0
         seen_rows += len(take)
         rec = {"step": step + 1, "loss": loss, "targets": count, "lr": lr, "grad_norm": float(gn), **({"reg": reg_val} if reg_val is not None else {}),
-               "tokens": sum(len(rows[i]["input_ids"]) for i in take), "microbatches": len(mbs)}
+               "tokens": sum(len(rows[i]["input_ids"]) for i in take), "slot_tokens": sum(slot_tokens(mb) for mb in mbs),
+               "microbatches": len(mbs)}
         if (step + 1) % 100 == 0 or step + 1 == args.steps:
             sync(device)
             now = time.perf_counter()
@@ -653,7 +762,8 @@ def train(args) -> dict:
             torch.save({"key": resume_key(args), "step": step + 1, "model": model.state_dict(), "opt": opt.state_dict(),
                         "rng": rng.getstate(), "py_random": random.getstate(), "torch_rng": torch.get_rng_state(),
                         "order": list(order), "log": list(log), "per100": list(per100), "checks": dict(checks),
-                        "seen_rows": seen_rows, "elapsed_s": prior_s + time.perf_counter() - t_start}, tmp)
+                        "seen_rows": seen_rows, "elapsed_s": prior_s + time.perf_counter() - t_start,
+                        "optim_s": optim_s}, tmp)
             os.replace(tmp, ckpt)
     sync(device)
     train_seconds = prior_s + time.perf_counter() - t_start
@@ -724,6 +834,11 @@ def train(args) -> dict:
         "device": device, "adam_impl": "fused" if args.adam_fused else "torch default (foreach on CUDA)", "hardware": hardware_label(device), "dtype": "float32 weights/grads/AdamW state; compute " + ("bf16 autocast (CUDA)" if AUTOCAST["dtype"] else "float32 (TF32 off)")
         + ("; frozen nn.Linear weights stored in bf16 during training (exact)" if args.frozen_bf16 else ""),
         "torch": torch.__version__, "train_seconds": round(train_seconds, 1), "seconds_per_100_steps": per100,
+        "optimizer": {**optim_info, "optim_seconds": round(optim_s, 3),
+                      "optim_step_share": round(optim_s / train_seconds, 4) if train_seconds > 0 else 0.0},
+        "packing": {"pack": bool(args.pack), "real_tokens": sum(r["tokens"] for r in log),
+                    "slot_tokens": sum(r["slot_tokens"] for r in log),
+                    "real_tokens_per_s": round(sum(r["tokens"] for r in log) / train_seconds, 1) if train_seconds > 0 else 0.0},
         "peak_rss_mb": round(peak_rss_mb(), 1), "checks": checks,
         "first_loss": log[0]["loss"], "last_loss": log[-1]["loss"],
         "mean_loss_first_20": sum(r["loss"] for r in log[:20]) / min(20, len(log)),
@@ -761,6 +876,11 @@ def parse_args(argv=None):
     ap.add_argument("--min-lr-ratio", type=float, default=0.1)
     ap.add_argument("--wd", type=float, default=0.0)
     ap.add_argument("--clip", type=float, default=1.0)
+    ap.add_argument("--optim", choices=OPTIMS, default="adamw",
+                    help="hybrid_muon: 2D matrices on Muon (no weight decay), the rest on AdamW (TSAI 28 Nov rule)")
+    ap.add_argument("--muon-lr", type=float, default=None, help="peak LR of the Muon group (with --optim hybrid_muon)")
+    ap.add_argument("--pack", action="store_true",
+                    help="pack each update's rows into one <= --micro-tokens sequence per microbatch (block-diagonal mask)")
     ap.add_argument("--adam-fused", action="store_true",
                     help="fused AdamW kernel (no step temporary of trainable-weight size; needed for 8B full FT on one H200)")
     ap.add_argument("--seed", type=int, default=1)

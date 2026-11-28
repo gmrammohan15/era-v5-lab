@@ -67,8 +67,10 @@ class RewardEnvTask:
     """train/heldout are lists of (env_id, prompt_text). The completion is decoded and scored by reward_fn."""
 
     def __init__(self, tokenizer, train: list[tuple[str, str]], heldout: list[tuple[str, str]],
-                 reward_fn: Callable[[str, str], tuple[float, dict]] | None = None):
+                 reward_fn: Callable[[str, str], tuple[float, dict]] | None = None,
+                 template_kwargs: dict | None = None):
         self.tok = tokenizer
+        self.template_kwargs = dict(template_kwargs or {})  # extra chat-template variables, e.g. {"effort": "1k"}
         self.reward_fn = reward_fn or default_reward_fn()
         self._items = {}
         self.train = [self._encode(e, p) for e, p in train]
@@ -79,7 +81,7 @@ class RewardEnvTask:
             ids = [int(x) for x in self.tok.encode_prompt(prompt)]
         else:  # Hugging Face tokenizer
             msgs = [{"role": "user", "content": prompt}]
-            ids = self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+            ids = self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True, **self.template_kwargs)
             ids = [int(x) for x in (ids["input_ids"] if hasattr(ids, "keys") else ids)]  # BatchEncoding is not a dict
         key = tuple(ids)
         if key in self._items:  # one prompt must map to one env id, and no prompt may sit in both splits
