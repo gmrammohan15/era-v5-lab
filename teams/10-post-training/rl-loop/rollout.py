@@ -75,12 +75,26 @@ class G5BatchSampler:
 class HFBatchSampler:
     """All prompts x k in one left-padded model.generate. Hugging Face models only (they take a padding mask)."""
 
-    def __init__(self, policy, pad_id: int | None = None):
+    def __init__(self, policy, pad_id: int | None = None, max_rows: int | None = None):
+        if max_rows is not None and max_rows < 1:
+            raise ValueError("sampler_max_rows must be at least 1")
         self.policy = policy
         self.pad_id = pad_id if pad_id is not None else (policy.eos_id if policy.eos_id is not None else 0)
+        self.max_rows = max_rows  # None: every row in one generate (the historical behaviour)
+
+    def sample(self, prompts, k, max_new, temperature, generator=None) -> list[Rollout]:
+        """max_rows caps the rows of one generate (KV cache memory); each chunk draws its own seed from `generator`,
+        so a chunked call samples differently from an unchunked one."""
+        if self.max_rows is None or len(prompts) * k <= self.max_rows:
+            return self._sample(prompts, k, max_new, temperature, generator)
+        per = max(1, self.max_rows // k)
+        out = []
+        for i in range(0, len(prompts), per):
+            out += self._sample(prompts[i:i + per], k, max_new, temperature, generator)
+        return out
 
     @torch.no_grad()
-    def sample(self, prompts, k, max_new, temperature, generator=None) -> list[Rollout]:
+    def _sample(self, prompts, k, max_new, temperature, generator=None) -> list[Rollout]:
         pol, dev, pad = self.policy, self.policy.device, self.pad_id
         if generator is not None:  # generate() has no generator argument; seed torch from ours
             torch.manual_seed(int(torch.randint(0, 2**31 - 1, (1,), generator=generator)))
@@ -203,15 +217,16 @@ class VLLMSampler:
             self.llm.wake_up()
 
 
-def make_sampler(kind: str, policy, vllm: VLLMSampler | None = None, pad_id: int | None = None, max_rows: int = 128):
+def make_sampler(kind: str, policy, vllm: VLLMSampler | None = None, pad_id: int | None = None,
+                 max_rows: int | None = 128):
     if kind == "policy":
         return PolicySampler(policy)
     if kind == "g5_batch":
         if not hasattr(policy, "sample_many"):
             raise ValueError("sampler g5_batch needs a policy with sample_many (Team 5's adapter policy)")
-        return G5BatchSampler(policy, max_rows)
+        return G5BatchSampler(policy, 128 if max_rows is None else max_rows)
     if kind == "hf_batch":
-        return HFBatchSampler(policy, pad_id)
+        return HFBatchSampler(policy, pad_id, max_rows)
     if kind == "vllm":
         if vllm is None:
             raise ValueError("sampler vllm needs a VLLMSampler created before the model")

@@ -256,7 +256,7 @@ def grpo_config(work: Path, sft_model: Path, out: Path, optim: str, steps: int, 
     prep = work / "prep"
     train = {"algo": "objective_v1", "steps": steps, "prompts_per_step": 16, "k": 8, "max_new": 384,
              "temperature": 1.0, "lr": 1.0e-6, "ppo_epochs": 1, "grad_clip": 1.0, "eval_every": 10, "eval_k": 1,
-             "sampler": "hf_batch", "micro_rows": 4, "state_dir": str(out / "state"), "state_every": 10,
+             "sampler": "hf_batch", "sampler_max_rows": 64, "micro_rows": 4, "state_dir": str(out / "state"), "state_every": 10,
              "screen": {"n": 64, "k": 8, "min_mixed": 8}, "time_sync": True,
              "save_trainable": str(out / "trainable_fp32.pt"), "save_trainable_dtype": "float32"}
     if not screen:

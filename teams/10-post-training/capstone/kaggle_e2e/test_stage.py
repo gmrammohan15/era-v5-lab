@@ -55,7 +55,7 @@ def test_grpo_config_is_accepted_by_the_rl_loop(tmp_path, optim):
     assert cfg["task"]["chat_template_kwargs"] == {"effort": stage.EFFORT} and t["algo"] == "objective_v1"
     assert "kl_coef" not in t and "tis_clip" not in t and t["max_train_seconds"] == 3600
     assert "deadline_unix" not in t and t["save_trainable_dtype"] == "float32"
-    assert cfg["model"]["dense"] is True and t["screen"]["n"] == 64
+    assert cfg["model"]["dense"] is True and t["screen"]["n"] == 64 and t["sampler_max_rows"] == 64
     assert "screen" not in stage.grpo_config(tmp_path, tmp_path, tmp_path, optim, 2, None, screen=False)["train"]
     _, info = train.build_optimizer(t, [("w", __import__("torch").nn.Parameter(__import__("torch").zeros(4, 4)))])
     assert info["kind"] == optim

@@ -28,7 +28,8 @@ Task kinds (config `task.kind`): toy (see tasks.py), code_tasks (rl/tasks via rl
 GPU-run options (config `train.*`, all optional):
     sampler        policy | g5_batch | hf_batch | vllm (rollout.py). Default hf_batch for HF models, policy otherwise.
                    g5_batch (G5 only): every prompt of a step in one KV-cached decode; sampler_max_rows (default 128)
-                   caps the rows decoded together.
+                   caps the rows decoded together. hf_batch: sampler_max_rows (default unset = all rows in one
+                   generate) caps the rows of one generate, e.g. a 512-row screen on a 16 GB GPU.
     vllm           kwargs for the colocated engine, e.g. {gpu_memory_utilization: 0.3, max_model_len: 2048}
     fp32_master    default true: trainable weights in fp32 under bf16 autocast (policy.use_fp32_master)
     autocast       bf16 | unset (default): force bf16 autocast for the policy's forward. Needed for a G5 checkpoint,
@@ -1043,8 +1044,13 @@ def train(cfg: dict) -> dict:
     def sync_named():  # what the sampler must hold after an update
         return dt_hard_weights(dtmask, model) if dt_cfg else trainable_named
     pad_id = tok.pad_token_id if tok is not None and tok.pad_token_id is not None else None
-    sampler = rollout.make_sampler(sampler_kind, policy, vllm, pad_id,
-                                   **({"max_rows": int(t.get("sampler_max_rows", 128))} if sampler_kind == "g5_batch" else {}))
+    if sampler_kind == "g5_batch":
+        max_rows = {"max_rows": int(t.get("sampler_max_rows", 128))}
+    elif sampler_kind == "hf_batch":  # unset: one generate for every row, as before the option existed
+        max_rows = {"max_rows": int(t["sampler_max_rows"]) if t.get("sampler_max_rows") is not None else None}
+    else:
+        max_rows = {}
+    sampler = rollout.make_sampler(sampler_kind, policy, vllm, pad_id, **max_rows)
     ref = None
     if float(t.get("kl_coef", 0)) > 0:
         ref = copy.deepcopy(policy)
